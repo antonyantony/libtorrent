@@ -75,16 +75,24 @@ ChunkSelector::cleanup() {
 // Consider if ChunksSelector::not_using_index(...) needs to be
 // modified.
 void
-ChunkSelector::update_priorities() {
-  if (empty())
+ChunkSelector::update_priorities ()
+{
+  int r = 0;
+  if (empty ())
     return;
 
-  m_sharedQueue.clear();
+  m_sharedQueue.clear ();
 
   if (m_position == invalid_chunk)
-    m_position = random() % size();
-
-  advance_position();
+    {
+      // m_position = random() % (size() % 10);
+      // m_position = random() % size();
+      r = size () % 10;
+      if(!r)
+	r = 1;
+      m_position = random () % r;
+    }
+  advance_position ();
 }
 
 uint32_t
@@ -104,7 +112,10 @@ ChunkSelector::find(PeerChunks* pc, __UNUSED bool highPriority) {
   // inefficient distribution with a slow seed and fast peers
   // all arriving at the same position.
   if ((random() & 63) == 0) {
-    m_position = random() % size();
+      int r = size () % 10;
+      if(!r)
+	r = 1;
+      m_position = random () % r;
     queue->clear();
   }
 
