@@ -52,6 +52,38 @@
 
 namespace torrent {
 
+const instrumentation_enum request_list_constants::instrumentation_added[bucket_count] = {
+  INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_ADDED,
+  INSTRUMENTATION_TRANSFER_REQUESTS_UNORDERED_ADDED,
+  INSTRUMENTATION_TRANSFER_REQUESTS_STALLED_ADDED,
+  INSTRUMENTATION_TRANSFER_REQUESTS_CHOKED_ADDED
+};
+const instrumentation_enum request_list_constants::instrumentation_moved[bucket_count] = {
+  INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_MOVED,
+  INSTRUMENTATION_TRANSFER_REQUESTS_UNORDERED_MOVED,
+  INSTRUMENTATION_TRANSFER_REQUESTS_STALLED_MOVED,
+  INSTRUMENTATION_TRANSFER_REQUESTS_CHOKED_MOVED
+};
+const instrumentation_enum request_list_constants::instrumentation_removed[bucket_count] = {
+  INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_REMOVED,
+  INSTRUMENTATION_TRANSFER_REQUESTS_UNORDERED_REMOVED,
+  INSTRUMENTATION_TRANSFER_REQUESTS_STALLED_REMOVED,
+  INSTRUMENTATION_TRANSFER_REQUESTS_CHOKED_REMOVED
+};
+const instrumentation_enum request_list_constants::instrumentation_total[bucket_count] = {
+  INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_TOTAL,
+  INSTRUMENTATION_TRANSFER_REQUESTS_UNORDERED_TOTAL,
+  INSTRUMENTATION_TRANSFER_REQUESTS_STALLED_TOTAL,
+  INSTRUMENTATION_TRANSFER_REQUESTS_CHOKED_TOTAL
+};
+
+// Make inline...
+template <>
+void
+request_list_constants::destroy<BlockTransfer*>(BlockTransfer*& obj) {
+  Block::release(obj);
+}
+
 // TODO: Add a to-be-cancelled list, timer, and use that to avoid
 // cancelling pieces on CHOKE->UNCHOKE weirdness in some clients.
 //
@@ -59,8 +91,6 @@ namespace torrent {
 // pieces, perhaps add a timer for last choke and check the request
 // time on the queued pieces. This makes it possible to get going
 // again if the remote queue got cleared.
-//
-// Add unit tests...
 
 // It is assumed invalid transfers have been removed.
 struct request_list_same_piece {
@@ -75,116 +105,93 @@ struct request_list_same_piece {
   Piece m_piece;
 };
 
-inline BlockTransfer*
-RequestList::pop_front_queued() {
-  BlockTransfer* transfer = m_queued.front();
-  m_queued.pop_front();
+RequestList::~RequestList() {
+  if (m_transfer != NULL)
+    throw internal_error("request dtor m_transfer != NULL");
 
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_REMOVED, 1);
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_TOTAL, -1);
+  if (!m_queues.empty())
+    throw internal_error("request dtor m_queues not empty");
 
-  return transfer;
-}
-
-inline void
-RequestList::push_back_queued(BlockTransfer* r) {
-  m_queued.push_back(r);
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_ADDED, 1);
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_TOTAL, 1);
-}
-
-inline void
-RequestList::push_back_canceled(BlockTransfer* r) {
-  m_canceled.push_back(r);
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_CANCELED_ADDED, 1);
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_CANCELED_TOTAL, 1);
-}
-
-inline void
-RequestList::release_queued_range(ReserveeList::iterator begin, ReserveeList::iterator end) {
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_REMOVED, std::distance(begin, end));
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_TOTAL, -(int64_t)std::distance(begin, end));
-
-  std::for_each(begin, end, std::ptr_fun(&Block::release));
-  m_queued.erase(begin, end);
-}
-
-inline void
-RequestList::release_canceled_range(ReserveeList::iterator begin, ReserveeList::iterator end) {
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_CANCELED_REMOVED, std::distance(begin, end));
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_CANCELED_TOTAL, -(int64_t)std::distance(begin, end));
-
-  std::for_each(begin, end, std::ptr_fun(&Block::release));
-  m_canceled.erase(begin, end);
-}
-
-inline void
-RequestList::move_to_canceled_range(ReserveeList::iterator begin, ReserveeList::iterator end) {
-  int64_t range_size = std::distance(begin, end);
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_CANCELED_ADDED, range_size);
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_CANCELED_TOTAL, range_size);
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_REMOVED, range_size);
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_TOTAL,  -range_size);
-
-  std::for_each(begin, end, std::ptr_fun(&Block::stalled));
-
-  if (m_canceled.empty() && begin == m_queued.begin() && end == m_queued.end()) {
-    m_canceled.swap(m_queued);
-  } else {
-    m_canceled.insert(m_canceled.end(), begin, end);
-    m_queued.erase(begin, end);
-  }
-}
-
-inline void
-RequestList::move_queued_to_transferring(ReserveeList::iterator itr) {
-  m_transfer = *itr;
-  m_queued.erase(itr);
-
-  // When we start a normal transfer we don't count it as removed.
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_QUEUED_TOTAL, -1);
-}
-
-inline void
-RequestList::move_canceled_to_transferring(ReserveeList::iterator itr) {
-  m_transfer = *itr;
-  m_canceled.erase(itr);
-
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_CANCELED_TOTAL, -1);
+  priority_queue_erase(&taskScheduler, &m_delay_remove_choked);
+  priority_queue_erase(&taskScheduler, &m_delay_process_unordered);
 }
 
 const Piece*
 RequestList::delegate() {
-  BlockTransfer* r = m_delegator->delegate(m_peerChunks, m_affinity);
+  BlockTransfer* transfer = m_delegator->delegate(m_peerChunks, m_affinity);
 
-  if (r) {
-    m_affinity = r->index();
-    push_back_queued(r);
+  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_DELEGATED, 1);
 
-    return &r->piece();
-
-  } else {
+  if (transfer == NULL)
     return NULL;
-  }
-}
 
-// Replace m_canceled with m_queued and set them to stalled.
-//
-// This doesn't seem entirely correct... Perhaps canceled requests
-// should be kept around until we hit a safe state where we may throw
-// them out?
-void
-RequestList::cancel() {
-  release_canceled_range(m_canceled.begin(), m_canceled.end());
-  move_to_canceled_range(m_queued.begin(), m_queued.end());
+  m_affinity = transfer->index();
+  m_queues.push_back(bucket_queued, transfer);
+
+  return &transfer->piece();
 }
 
 void
-RequestList::stall() {
+RequestList::stall_initial() {
+  m_queues.clear(bucket_unordered);
+
+  queue_bucket_for_all_in_queue(m_queues, bucket_unordered, std::ptr_fun(&Block::stalled));
+  m_queues.move_all_to(bucket_queued, bucket_unordered);
+}
+
+void
+RequestList::stall_prolonged() {
   if (m_transfer != NULL)
     Block::stalled(m_transfer);
 
-  std::for_each(m_queued.begin(), m_queued.end(), std::ptr_fun(&Block::stalled));
+  queue_bucket_for_all_in_queue(m_queues, bucket_queued, std::ptr_fun(&Block::stalled));
+}
+
+void
+RequestList::choked() {
+  // Check if we want to update the choke timer; if non-zero and
+  // updated within a short timespan?
+
+  m_last_choke = cachedTime;
+
+  if (m_queues.queue_empty(bucket_queued) && m_queues.queue_empty(bucket_unordered))
+    return;
+
+  m_queues.move_all_to(bucket_queued, bucket_choked);
+  m_queues.move_all_to(bucket_unordered, bucket_choked);
+  m_queues.move_all_to(bucket_stalled, bucket_choked);
+
+  if (!m_delay_remove_choked.is_queued())
+    priority_queue_insert(&taskScheduler, &m_delay_remove_choked,
+                          (cachedTime + rak::timer::from_seconds(6)).round_seconds());
+}
+
+void
+RequestList::unchoked() {
+  m_last_unchoke = cachedTime;
+
+  priority_queue_erase(&taskScheduler, &m_delay_remove_choked);
+
+  // Clear choked queue if the peer doesn't start sending previously
+  // requested pieces.
+  //
+  // This handles the case where a peer does a choke immediately
+  // followed unchoke before starting to send pieces.
+  if (!m_queues.queue_empty(bucket_choked)) {
+    priority_queue_insert(&taskScheduler, &m_delay_remove_choked,
+                          (cachedTime + rak::timer::from_seconds(60)).round_seconds());
+  }
+}
+
+void
+RequestList::delay_remove_choked() {
+  m_queues.clear(bucket_choked);
+}
+
+void
+RequestList::delay_process_unordered() {
+
+  // Remove requests 
 }
 
 void
@@ -192,8 +199,10 @@ RequestList::clear() {
   if (is_downloading())
     skipped();
 
-  release_queued_range(m_queued.begin(), m_queued.end());
-  release_canceled_range(m_canceled.begin(), m_canceled.end());
+  m_queues.clear(bucket_queued);
+  m_queues.clear(bucket_unordered);
+  m_queues.clear(bucket_stalled);
+  m_queues.clear(bucket_choked);
 }
 
 bool
@@ -201,27 +210,37 @@ RequestList::downloading(const Piece& piece) {
   if (m_transfer != NULL)
     throw internal_error("RequestList::downloading(...) m_transfer != NULL.");
 
-  ReserveeList::iterator itr = std::find_if(m_queued.begin(), m_queued.end(), request_list_same_piece(piece));
+  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_DOWNLOADING, 1);
 
-  if (itr == m_queued.end()) {
-    itr = std::find_if(m_canceled.begin(), m_canceled.end(), request_list_same_piece(piece));
+  std::pair<int, queues_type::iterator> itr =
+    queue_bucket_find_if_in_any(m_queues, request_list_same_piece(piece));
 
-    if (itr == m_canceled.end()) {
-      // Consider counting these pieces as spam.
-      instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_UNKNOWN, 1);
-      goto downloading_error;
-    }
+  switch (itr.first) {
+  case bucket_queued:
+    if (itr.second != m_queues.begin(bucket_queued))
+      cancel_range(itr.second);
 
-    move_canceled_to_transferring(itr);
+    m_transfer = m_queues.take(itr.first, itr.second);
+    break;
+  case bucket_unordered:
+    m_transfer = m_queues.take(itr.first, itr.second);
+    break;
+  case bucket_stalled:
+    m_transfer = m_queues.take(itr.first, itr.second);
+    break;
+  case bucket_choked:
+    m_transfer = m_queues.take(itr.first, itr.second);
 
-  } else if (itr == m_queued.end()) {
-    move_queued_to_transferring(itr);
+    // We make sure that the choked queue eventually gets cleared if
+    // the peer has skipped sending some pieces from the choked queue.
+    priority_queue_erase(&taskScheduler, &m_delay_remove_choked);
+    priority_queue_insert(&taskScheduler, &m_delay_remove_choked,
+                          (cachedTime + rak::timer::from_seconds(60)).round_seconds());
+    break;
+  default:
+    goto downloading_error;
+  };
 
-  } else {
-    cancel_range(itr);
-    move_queued_to_transferring(itr);
-  }
-  
   // We received an invalid piece length, propably zero length due to
   // the peer not being able to transfer the requested piece.
   //
@@ -232,12 +251,8 @@ RequestList::downloading(const Piece& piece) {
       throw communication_error("Peer sent a piece with wrong, non-zero, length.");
 
     Block::release(m_transfer);
-
-    instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_UNKNOWN, 1);
     goto downloading_error;
   }
-
-  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_DOWNLOADING, 1);
 
   // Check if piece isn't wanted anymore. Do this after the length
   // check to ensure we return a correct BlockTransfer.
@@ -252,6 +267,8 @@ RequestList::downloading(const Piece& piece) {
   // information.
   m_transfer = new BlockTransfer();
   Block::create_dummy(m_transfer, m_peerChunks->peer_info(), piece);
+
+  instrumentation_update(INSTRUMENTATION_TRANSFER_REQUESTS_UNKNOWN, 1);
 
   return false;
 }
@@ -295,6 +312,7 @@ RequestList::transfer_dissimilar() {
   Block::create_dummy(dummy, m_peerChunks->peer_info(), m_transfer->piece());
   dummy->set_position(m_transfer->position());
 
+  // TODO.... peer_info still on a block we no longer control?..
   m_transfer->block()->transfer_dissimilar(m_transfer);
   m_transfer = dummy;
 }
@@ -316,11 +334,6 @@ RequestList::is_interested_in_active() const {
   return false;
 }
 
-bool
-RequestList::has_index(uint32_t index) {
-  return std::find_if(m_queued.begin(), m_queued.end(), std::bind2nd(equals_reservee(), index)) != m_queued.end();
-}
-
 struct request_list_keep_request {
   bool operator () (const BlockTransfer* d) {
     return d->is_valid();
@@ -328,35 +341,36 @@ struct request_list_keep_request {
 };
 
 void
-RequestList::cancel_range(ReserveeList::iterator end) {
-  // This only gets called when it's downloading a non-canceled piece,
-  // so to avoid a backlog of canceled pieces we need to empty it
+RequestList::cancel_range(queues_type::iterator end) {
+  // This only gets called when it's downloading a non-unordered piece,
+  // so to avoid a backlog of unordered pieces we need to empty it
   // here.
   //
   // This may cause us to skip pieces if the peer does some strange
   // reordering.
   //
   // Add some extra checks here to avoid clearing too often.
-  if (!m_canceled.empty()) {
+  if (!m_queues.queue_empty(bucket_unordered)) {
     // Old buggy...
-    // release_canceled_range(m_canceled.begin(), m_canceled.end());
+    // release_unordered_range(m_unordered.begin(), m_queues.end(bucket_unordered));
 
 
     // Only release if !valid or... if we've been choked/unchoked
     // since last time, include a timer for both choke and unchoke.
 
     // First remove all the !valid pieces...
-    ReserveeList::iterator itr = std::partition(m_canceled.begin(), m_canceled.end(), request_list_keep_request());
+    queues_type::iterator itr = std::partition(m_queues.begin(bucket_unordered), m_queues.end(bucket_unordered),
+                                                request_list_keep_request());
 
-    release_canceled_range(itr, m_canceled.end());
+    m_queues.destroy(bucket_unordered, itr, m_queues.end(bucket_unordered));
   }
 
-  while (m_queued.begin() != end) {
-    BlockTransfer* transfer = pop_front_queued();
+  while (m_queues.begin(bucket_queued) != end) {
+    BlockTransfer* transfer = m_queues.pop_and_front(bucket_queued);
 
     if (request_list_keep_request()(transfer)) {
       Block::stalled(transfer);
-      push_back_canceled(transfer);
+      m_queues.push_back(bucket_unordered, transfer);
 
     } else {
       Block::release(transfer);
